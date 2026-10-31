@@ -31,8 +31,13 @@ QuestieBridge.QuestPools = 1
 # Report quests disabled through AzerothCore's loaded DisableMgr.
 QuestieBridge.QuestDisables = 1
 
-# Filter observed NPC quest starters that lack live questgiver functionality.
+# Filter observed NPC quest starters that lack live questgiver functionality, or that
+# their scripts or visibility conditions hide from the player.
 QuestieBridge.Questgivers = 1
+
+# Hide quests whose availability conditions the player fails, such as personal
+# progression milestones, like disabled quests until they open. Needs QuestDisables.
+QuestieBridge.QuestConditions = 1
 
 # Report Wintergrasp control/battle state and scripted attacker/defender quest gates.
 # Includes the eight attacking variants that inherit a defending pool selection.

@@ -8,8 +8,10 @@ Install both the module and addon to use these features.
 
 - Live holidays, fishing tournaments, Scourge Invasion, and Isle of Quel'Danas unlocks.
 - Selected daily/weekly quest pools, ICC weekly quests, and Wintergrasp control.
-- Quests explicitly disabled by the running AzerothCore server.
-- Live NPC questgiver-flag filtering for loaded, visible creatures in the player's zone.
+- Quests explicitly disabled by the running AzerothCore server, and quests whose availability
+  conditions the player fails, such as personal progression milestones.
+- Live NPC questgiver-flag filtering for loaded creatures in the player's zone, including NPCs
+  their scripts or visibility conditions hide from the player.
 - Weekly/monthly quest resets and live XP, reputation, and money rates.
 - Moving questgiver markers in your current zone, including Orgrim's Hammer and the Skybreaker.
 - Phase-dependent locations in supported story areas, including Icecrown, Storm Peaks, and the death knight start.
@@ -47,7 +49,8 @@ All options default to `1` (enabled). Set an option to `0` to disable it, then r
 | `QuestieBridge.Kaluak` | Kalu'ak winner-dependent quests |
 | `QuestieBridge.QuestPools` | Daily/weekly quest pool selections |
 | `QuestieBridge.QuestDisables` | Quests disabled through the loaded DisableMgr |
-| `QuestieBridge.Questgivers` | Live questgiver-flag filtering for observed NPCs |
+| `QuestieBridge.Questgivers` | Live questgiver-flag filtering for observed NPCs, and NPCs hidden from the player |
+| `QuestieBridge.QuestConditions` | Quests whose availability conditions the player fails, reported with `QuestDisables` |
 | `QuestieBridge.Wintergrasp` | Wintergrasp quests and questgiver locations |
 | `QuestieBridge.ICC` | Weekly quests in the player's current ICC instance |
 | `QuestieBridge.Resets` | Weekly/monthly reset timing |
@@ -81,10 +84,16 @@ Rate changes through `.reload config` and `.reload reputation_reward_rate` need 
 or corrections regeneration. XP bonuses do not increase the maximum-level money bonus.
 Reward previews can differ from final awards because of server rounding, caps, or custom rules.
 
-Questgiver filtering applies only to observed, loaded, visible NPC spawn IDs in the player's 
-current zone. Missing, unloaded, or unidentified spawns remain unknown. Questie filters only 
-matching starter locations, preserving unrelated spawns, item and gameobject starters, and 
-the quest itself.
+Questgiver filtering applies only to observed, loaded NPC spawn IDs in the player's current zone.
+An NPC that its scripts or visibility conditions hide from the player counts as offering no quest,
+unless every quest it starts is hidden already. Missing, unloaded, or unidentified spawns remain unknown.
+Questie filters only matching starter locations, preserving unrelated spawns, item and gameobject
+starters, and the quest itself.
+
+Quests whose availability conditions the player fails are reported like disabled quests while they
+stay closed, so `/qserver quest <quest ID>` shows them as disabled. A quest already in the quest log
+stays tracked. Conditions that change with the player's state, such as reputation or completed
+quests, are reread every two seconds. If the list does not fit in one snapshot, none of it is sent.
 
 Patrol markers follow loaded, visible NPCs in your current zone; remote maps keep static locations
 and patrol lines. Phase filtering applies within your current subarea. Quest prerequisites,

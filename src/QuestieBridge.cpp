@@ -6,6 +6,7 @@
 #include "Chat.h"
 #include "Config.h"
 #include "Creature.h"
+#include "CreatureAI.h"
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
 #include "GameTime.h"
@@ -30,6 +31,7 @@
 #include "QuestieBridgeReputation.h"
 #include "QuestieBridgeMoney.h"
 #include "QuestieBridgeStateCache.h"
+#include "QuestieBridgeConditions.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +42,7 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -65,9 +68,13 @@ constexpr uint32 QuestReputation = 2048;
 constexpr uint32 QuestMoney = 4096;
 constexpr uint32 QuestDisables = 8192;
 constexpr uint32 Questgivers = 16384;
+constexpr uint32 QuestConditions = 32768;
 constexpr std::size_t PhaseMaxRows = QuestieBridge::PhaseMaxRows;
+// The client accepts at most this many unavailable questgiver spawns in one snapshot.
+constexpr std::size_t MaxUnavailableGivers = 64;
 std::atomic<uint32> Capabilities{Events | Values | Progress | Kaluak | QuestPools | Wintergrasp | ICC
-    | Resets | Phases | Patrols | QuestXP | QuestReputation | QuestMoney | QuestDisables | Questgivers};
+    | Resets | Phases | Patrols | QuestXP | QuestReputation | QuestMoney | QuestDisables | Questgivers
+    | QuestConditions};
 std::atomic<bool> Dirty{false};
 using Clock = std::chrono::steady_clock;
 
@@ -167,6 +174,23 @@ bool ParseAcknowledgement(std::string const& payload, std::size_t body, uint64& 
     auto const result = std::from_chars(first, end, sequence);
     // Match the client's exact integer range; never acknowledge an unreceived snapshot.
     return result.ec == std::errc() && result.ptr == end && sequence > 0 && sequence <= 9007199254740991ULL;
+}
+
+bool HasCapability(std::string const& caps, std::string_view capability)
+{
+    for (std::size_t first = 0; first <= caps.size();)
+    {
+        std::size_t const end = std::min(caps.find(',', first), caps.size());
+        if (std::string_view(caps).substr(first, end - first) == capability)
+            return true;
+        first = end + 1;
+    }
+    return false;
+}
+
+bool IsQuestDisabled(uint32 questId)
+{
+    return sDisableMgr->IsDisabledFor(DISABLE_TYPE_QUEST, questId, nullptr);
 }
 
 void Send(Player* player, std::string const& payload)
@@ -357,6 +381,8 @@ public:
                 caps |= QuestDisables;
             if (sConfigMgr->GetOption<bool>("QuestieBridge.Questgivers", true))
                 caps |= Questgivers;
+            if (sConfigMgr->GetOption<bool>("QuestieBridge.QuestConditions", true))
+                caps |= QuestConditions;
             if (sConfigMgr->GetOption<bool>("QuestieBridge.Wintergrasp", true))
                 caps |= Wintergrasp;
             if (sConfigMgr->GetOption<bool>("QuestieBridge.ICC", true))
@@ -442,6 +468,30 @@ public:
                         rows.push_back("W:" + std::to_string(id) + ':'
                             + std::to_string(sWorldState->getWorldState(id)));
                 std::string playerCaps = common.Caps;
+                std::size_t const lateRows = ((capabilities & Questgivers) ? MaxUnavailableGivers + 1 : 0)
+                    + ((capabilities & Phases) ? PhaseMaxRows : 0)
+                    + ((capabilities & ICC) ? QuestieBridgeICCMaxRows : 0)
+                    + ((capabilities & QuestXP) ? 1 : 0)
+                    + ((capabilities & QuestReputation) ? QuestieBridge::ReputationMaxRows : 0)
+                    + ((capabilities & QuestMoney) ? 1 : 0)
+                    + (common.ReportResets ? 1 : 0);
+                // Quests this character's availability conditions refuse, such as personal
+                // progression milestones, join the server-wide disables while they stay closed.
+                std::set<uint32> locked;
+                if ((capabilities & QuestConditions) && HasCapability(common.Caps, "QUESTDISABLES"))
+                {
+                    locked = QuestieBridge::ConditionLockedQuests(std::views::keys(sObjectMgr->GetQuestTemplates()),
+                        [player](uint32 questId)
+                        {
+                            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+                            return !quest || player->SatisfyQuestConditions(quest, false);
+                        }, IsQuestDisabled);
+                    // A partial list would show closed quests as open, so it is all or nothing.
+                    if (rows.size() + locked.size() + lateRows > 4096)
+                        locked.clear();
+                    for (uint32 questId : locked)
+                        rows.push_back("D:" + std::to_string(questId));
+                }
                 if (capabilities & Questgivers)
                 {
                     uint32 const zone = player->GetZoneId();
@@ -452,17 +502,30 @@ public:
                     {
                         Creature* creature = spawn.second;
                         if (!creature || !creature->IsInWorld() || !creature->IsAlive()
-                            || creature->GetZoneId() != zone || !player->CanSeeOrDetect(creature)
-                            || creature->IsHostileTo(player)
+                            || creature->GetZoneId() != zone
                             || relations.find(creature->GetEntry()) == relations.end())
+                            continue;
+
+                        // An NPC its scripts or visibility conditions hide from the player offers no quest,
+                        // although the player cannot see it to observe its questgiver flag.
+                        bool const hidden = !player->CanSeeObjectByVisibilityConditions(creature)
+                            || (creature->IsAIEnabled && !creature->AI()->CanBeSeen(player));
+                        if ((!hidden && !player->CanSeeOrDetect(creature)) || creature->IsHostileTo(player))
                             continue;
 
                         auto const spawnId = creature->GetSpawnId();
                         if (!spawnId || spawnId > std::numeric_limits<uint32>::max())
                             continue;
 
+                        std::vector<uint32> started;
+                        auto const range = relations.equal_range(creature->GetEntry());
+                        for (auto it = range.first; it != range.second; ++it)
+                            started.push_back(it->second);
+                        bool const unavailable = QuestieBridge::UnavailableGiver(hidden, creature->IsQuestGiver(), started,
+                            [&locked](uint32 questId) { return locked.contains(questId) || IsQuestDisabled(questId); });
+
                         auto& active = observed[{creature->GetEntry(), static_cast<uint32>(spawnId)}];
-                        active = active || creature->IsQuestGiver();
+                        active = active || !unavailable;
                     }
 
                     std::vector<std::pair<uint32, uint32>> unavailable;
@@ -478,7 +541,7 @@ public:
                         + ((capabilities & QuestMoney) ? 1 : 0)
                         + (common.ReportResets ? 1 : 0);
 
-                    if (zone && unavailable.size() <= 64 && rows.size() + unavailable.size() + 1 + reserved <= 4096)
+                    if (zone && unavailable.size() <= MaxUnavailableGivers && rows.size() + unavailable.size() + 1 + reserved <= 4096)
                     {
                         playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTGIVERS");
                         rows.push_back("P:QG_CONTEXT:" + std::to_string(player->GetMapId()) + ':' + std::to_string(zone));
