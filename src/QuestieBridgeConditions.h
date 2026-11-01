@@ -24,14 +24,10 @@ std::set<std::uint32_t> ConditionLockedQuests(Quests const& quests, Satisfied&& 
     return locked;
 }
 
-// Whether an observed questgiver spawn must be reported as offering the character no quest. A visible
-// NPC lacks live questgiver functionality; an NPC its scripts or visibility conditions hide offers
-// nothing, unless every quest it starts is hidden already and its markers vanish anyway.
+// A hidden giver needs a negative observation only when one of its quests still has a marker.
 template <typename StartedQuests, typename QuestHidden>
-bool UnavailableGiver(bool hidden, bool questgiver, StartedQuests const& started, QuestHidden&& questHidden)
+bool HiddenGiverHasVisibleQuest(StartedQuests const& started, QuestHidden&& questHidden)
 {
-    if (!hidden)
-        return !questgiver;
     for (std::uint32_t questId : started)
         if (!questHidden(questId))
             return true;

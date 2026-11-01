@@ -30,16 +30,14 @@ void TestConditionLockedQuests()
     Require(!locked.contains(960), "server-wide disables are not repeated");
 }
 
-void TestUnavailableGivers()
+void TestHiddenGivers()
 {
     std::vector<std::uint32_t> const started{11123, 11124};
     auto none = [](std::uint32_t) { return false; };
     auto all = [](std::uint32_t) { return true; };
-    Require(!QuestieBridge::UnavailableGiver(false, true, started, none), "visible questgiver offers quests");
-    Require(QuestieBridge::UnavailableGiver(false, false, started, none), "visible NPC without the flag offers none");
-    Require(QuestieBridge::UnavailableGiver(true, true, started, none), "hidden NPC offers none despite its flag");
-    Require(!QuestieBridge::UnavailableGiver(true, true, started, all), "hidden NPC with hidden quests adds nothing");
-    Require(QuestieBridge::UnavailableGiver(true, true, started, [](std::uint32_t id) { return id == 11123; }),
+    Require(QuestieBridge::HiddenGiverHasVisibleQuest(started, none), "hidden NPC offers none despite its flag");
+    Require(!QuestieBridge::HiddenGiverHasVisibleQuest(started, all), "hidden NPC with hidden quests adds nothing");
+    Require(QuestieBridge::HiddenGiverHasVisibleQuest(started, [](std::uint32_t id) { return id == 11123; }),
         "one open quest keeps a hidden NPC reported");
 }
 }
@@ -47,6 +45,6 @@ void TestUnavailableGivers()
 int main()
 {
     TestConditionLockedQuests();
-    TestUnavailableGivers();
+    TestHiddenGivers();
     std::cout << "Questie bridge condition regressions passed\n";
 }

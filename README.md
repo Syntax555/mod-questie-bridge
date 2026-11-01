@@ -10,8 +10,8 @@ Install both the module and addon to use these features.
 - Selected daily/weekly quest pools, ICC weekly quests, and Wintergrasp control.
 - Quests explicitly disabled by the running AzerothCore server, and quests whose availability
   conditions the player fails, such as personal progression milestones.
-- Live NPC questgiver-flag filtering for loaded creatures in the player's zone, including NPCs
-  their scripts or visibility conditions hide from the player.
+- Global questgiver-template restrictions on zone, continent, and world maps.
+- Live NPC questgiver-flag filtering and positive overrides in the player's zone.
 - Weekly/monthly quest resets and live XP, reputation, and money rates.
 - Moving questgiver markers in your current zone, including Orgrim's Hammer and the Skybreaker.
 - Phase-dependent locations in supported story areas, including Icecrown, Storm Peaks, and the death knight start.
@@ -49,8 +49,9 @@ All options default to `1` (enabled). Set an option to `0` to disable it, then r
 | `QuestieBridge.Kaluak` | Kalu'ak winner-dependent quests |
 | `QuestieBridge.QuestPools` | Daily/weekly quest pool selections |
 | `QuestieBridge.QuestDisables` | Quests disabled through the loaded DisableMgr |
-| `QuestieBridge.Questgivers` | Live questgiver-flag filtering for observed NPCs, and NPCs hidden from the player |
+| `QuestieBridge.Questgivers` | Negative live questgiver-flag observations and NPCs hidden from the player |
 | `QuestieBridge.QuestConditions` | Quests whose availability conditions the player fails, reported with `QuestDisables` |
+| `QuestieBridge.QuestgiverTemplates` | Global template restrictions and required live positive exceptions |
 | `QuestieBridge.Wintergrasp` | Wintergrasp quests and questgiver locations |
 | `QuestieBridge.ICC` | Weekly quests in the player's current ICC instance |
 | `QuestieBridge.Resets` | Weekly/monthly reset timing |
@@ -66,7 +67,7 @@ All options default to `1` (enabled). Set an option to `0` to disable it, then r
 | --- | --- |
 | `/qserver` | Connection, versions, and live state |
 | `/qserver quest <quest ID>` | Whether a quest is explicitly disabled on the server |
-| `/qserver giver <NPC ID>` | Whether a local NPC is observed without questgiver functionality |
+| `/qserver giver <NPC ID>` | Global template restriction and unavailable observed spawn IDs |
 | `/qserver pool <pool ID>` | Selected quests in a pool; for example, `5678` for raid weeklies |
 | `/qserver wintergrasp` | Wintergrasp control and battle state |
 | `/qserver icc` | Weekly quests in your current ICC instance |
@@ -84,16 +85,21 @@ Rate changes through `.reload config` and `.reload reputation_reward_rate` need 
 or corrections regeneration. XP bonuses do not increase the maximum-level money bonus.
 Reward previews can differ from final awards because of server rounding, caps, or custom rules.
 
-Questgiver filtering applies only to observed, loaded NPC spawn IDs in the player's current zone.
-An NPC that its scripts or visibility conditions hide from the player counts as offering no quest,
-unless every quest it starts is hidden already. Missing, unloaded, or unidentified spawns remain unknown.
-Questie filters only matching starter locations, preserving unrelated spawns, item and gameobject
-starters, and the quest itself.
+The bridge reports global questgiver-template restrictions across all map zoom levels.
+Live NPC spawn observations take precedence locally, including scripted questgiver
+grants. Positive questgiver observations and patrol samples require the creature to be
+present at the player's client and pass current distance, phasing, and detection checks.
+Distant loaded creatures do not supply positive overrides; their template restrictions still apply.
+NPCs hidden by scripts or visibility conditions remain negative observations unless every quest
+they start is already hidden.
 
 Quests whose availability conditions the player fails are reported like disabled quests while they
 stay closed, so `/qserver quest <quest ID>` shows them as disabled. A quest already in the quest log
-stays tracked. Conditions that change with the player's state, such as reputation or completed
-quests, are reread every two seconds. If the list does not fit in one snapshot, none of it is sent.
+stays tracked. Conditions are reread every two seconds. An oversized list is withheld in full.
+
+Restrictions affect NPC queststarter markers and relevant tooltip lines, not quest
+eligibility, objectives, turn-ins, or item/gameobject starters. Missing, expired, or
+oversized server data restores Questie's normal static behavior.
 
 Patrol markers follow loaded, visible NPCs in your current zone; remote maps keep static locations
 and patrol lines. Phase filtering applies within your current subarea. Quest prerequisites,
@@ -103,6 +109,37 @@ Unavailable server information restores Questie's usual behavior. The bridge doe
 quest rewards, requirements, or reset schedules, and players without the addon can play normally.
 Entirely new custom quests still need addon data. For a protocol mismatch, install matching builds.
 Include `/qserver` output when [reporting an issue](https://github.com/Aldori15/mod-questie-bridge/issues).
+
+## Protocol
+
+Protocol **19** requires a matching addon. `INFO~1` remains the independent version
+diagnostic handshake; a mismatch restores static addon behavior without downgrading.
+
+Snapshots retain `BEGIN` / `PART` / `END`, with compact capabilities in the same field:
+
+```text
+BEGIN~19~token~sequence~mask~rowCount~partCount
+```
+
+The mask contains one to four uppercase, eight-digit hexadecimal 32-bit words,
+lowest capability range first, separated by `.`. Trailing zero words are omitted;
+the empty mask is `00000000`. All current capabilities together are `0003FFFF`.
+These permanent wire bits are independent of the internal configuration flags:
+
+| Bit | Capability | Bit | Capability |
+| --- | --- | --- | --- |
+| 0 | EVENTS | 9 | RESETS |
+| 1 | VALUES | 10 | PHASES |
+| 2 | SCOURGE | 11 | PATROLS |
+| 3 | QUELDANAS | 12 | QUESTXP |
+| 4 | KALUAK | 13 | QUESTREP |
+| 5 | HEARTBEAT | 14 | QUESTMONEY |
+| 6 | QUESTPOOLS | 15 | QUESTDISABLES |
+| 7 | WINTERGRASP | 16 | QUESTGIVERS |
+| 8 | ICC | 17 | QUESTGIVERTEMPLATES |
+
+Bits 18–127 are unassigned and rejected when set. Each word is decoded separately to
+preserve Lua 5.1 numeric precision.
 
 ## License
 

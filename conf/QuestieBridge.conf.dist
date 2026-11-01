@@ -39,6 +39,10 @@ QuestieBridge.Questgivers = 1
 # progression milestones, like disabled quests until they open. Needs QuestDisables.
 QuestieBridge.QuestConditions = 1
 
+# Global restrictions from loaded queststarter templates, including remote maps.
+# Live positive exceptions remain enabled even when Questgivers is disabled.
+QuestieBridge.QuestgiverTemplates = 1
+
 # Report Wintergrasp control/battle state and scripted attacker/defender quest gates.
 # Includes the eight attacking variants that inherit a defending pool selection.
 QuestieBridge.Wintergrasp = 1
