@@ -5,6 +5,7 @@
 
 #include "Chat.h"
 #include "Config.h"
+#include "ConditionMgr.h"
 #include "Creature.h"
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
@@ -461,6 +462,8 @@ public:
         _mapCreatures.Reset();
         auto const& common = _commonState.Get(now, capabilities, dirty, replyRequested,
             [capabilities]() { return BuildCommonState(capabilities); });
+        std::optional<QuestieBridge::QuestConditionIndex> conditions;
+        bool conditionsBuilt = false;
         for (auto const& [player, entry] : active)
         {
             Subscriber& subscriber = *entry;
@@ -596,6 +599,27 @@ public:
                 if ((capabilities & QuestMoney) && rows.size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
                     && QuestieBridge::AppendQuestMoney(rows))
                     playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTMONEY");
+                // Full era restrictions already evaluate these conditions when disables are available.
+                if ((capabilities & QuestConditions) && !HasCapability(common.Caps, "QUESTDISABLES"))
+                {
+                    // Shared for this tick; never reuse classification across a condition reload.
+                    if (!conditionsBuilt)
+                    {
+                        conditionsBuilt = true;
+                        conditions = QuestieBridge::BuildQuestConditionIndex(sObjectMgr->GetQuestTemplates(),
+                            [](uint32 id)
+                            {
+                                return sConditionMgr->GetConditionsForNotGroupedEntry(
+                                    CONDITION_SOURCE_TYPE_QUEST_AVAILABLE, id);
+                            }, [](uint32 id) { return sConditionMgr->GetConditionReferences(id); });
+                    }
+                    if (conditions)
+                        QuestieBridge::AppendQuestConditions(*conditions, [player](uint32 id)
+                        {
+                            Quest const* quest = sObjectMgr->GetQuestTemplate(id);
+                            return !quest || player->SatisfyQuestConditions(quest, false);
+                        }, rows, playerCaps, common.ReportResets ? 1 : 0);
+                }
                 std::string signature = playerCaps;
                 for (std::string const& row : rows)
                     signature += ';' + row;
