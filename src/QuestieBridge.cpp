@@ -619,13 +619,15 @@ public:
                         rows.push_back("W:" + std::to_string(id) + ':'
                             + std::to_string(sWorldState->getWorldState(id)));
                 std::string playerCaps = common.Caps;
-                std::size_t const lateRows = ((capabilities & (Questgivers | QuestgiverTemplates)) ? MaxGiverObservations + 1 : 0)
-                    + ((capabilities & Phases) ? PhaseMaxRows : 0)
+                // Rows the sections after the quest givers may still add.
+                std::size_t const reserved = ((capabilities & Phases) ? PhaseMaxRows : 0)
                     + ((capabilities & ICC) ? QuestieBridgeICCMaxRows : 0)
                     + ((capabilities & QuestXP) ? 1 : 0)
                     + ((capabilities & QuestReputation) ? QuestieBridge::ReputationMaxRows : 0)
                     + ((capabilities & QuestMoney) ? 1 : 0)
                     + (common.ReportResets ? 1 : 0);
+                std::size_t const lateRows =
+                    ((capabilities & (Questgivers | QuestgiverTemplates)) ? MaxGiverObservations + 1 : 0) + reserved;
                 // Quests this character's availability conditions refuse, such as personal
                 // progression milestones, join the server-wide disables while they stay closed.
                 std::set<uint32> locked;
@@ -692,14 +694,6 @@ public:
                         if (observations.size() > MaxGiverObservations)
                             break;
                     }
-
-                    std::size_t const reserved =
-                        ((capabilities & Phases) ? PhaseMaxRows : 0)
-                        + ((capabilities & ICC) ? QuestieBridgeICCMaxRows : 0)
-                        + ((capabilities & QuestXP) ? 1 : 0)
-                        + ((capabilities & QuestReputation) ? QuestieBridge::ReputationMaxRows : 0)
-                        + ((capabilities & QuestMoney) ? 1 : 0)
-                        + (common.ReportResets ? 1 : 0);
 
                     if (zone && observations.size() <= MaxGiverObservations && sharedRows + rows.size() + observations.size() + 1 + reserved <= 4096)
                     {
