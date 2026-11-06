@@ -3,14 +3,19 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include "CellImpl.h"
 #include "Chat.h"
 #include "Config.h"
 #include "ConditionMgr.h"
+#include "CryptoHash.h"
 #include "Creature.h"
+#include "DatabaseScript.h"
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
 #include "GameTime.h"
 #include "GitRevision.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -33,13 +38,16 @@
 #include "QuestieBridgeStateCache.h"
 #include "QuestieBridgeProtocol.h"
 #include "QuestieBridgeConditions.h"
+#include "QuestieBridgeDelivery.h"
 
 #include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <limits>
+#include <list>
 #include <map>
 #include <set>
 #include <mutex>
@@ -79,6 +87,15 @@ std::atomic<uint32> Capabilities{Events | Values | Progress | Kaluak | QuestPool
 std::atomic<bool> Dirty{false};
 using Clock = std::chrono::steady_clock;
 
+struct PendingSnapshot
+{
+    QuestieBridge::SnapshotDelivery Delivery;
+    std::string Signature;
+    std::string Catalog;
+    uint64 Sequence;
+    uint64 Revision;
+};
+
 struct Subscriber
 {
     std::string Token;
@@ -86,6 +103,8 @@ struct Subscriber
     Clock::time_point LastRequest;
     Clock::time_point LastSend;
     Clock::time_point LastStateCheck;
+    Clock::time_point LastPatrolCheck;
+    Clock::time_point RetryAfter;
     uint64 CommonRevision = 0;
     uint64 Sequence = 0;
     uint64 SnapshotSequence = 0;
@@ -93,12 +112,73 @@ struct Subscriber
     uint64 PatrolSnapshot = 0;
     std::string PatrolContext;
     bool ReplyRequested = false;
+    bool RenewalRequested = false;
     std::string Previous;
+    std::string KnownCatalog;
+    std::optional<PendingSnapshot> Pending;
 };
 
 std::mutex SubscriberMutex;
 std::map<ObjectGuid, Subscriber> Subscribers;
+std::deque<ObjectGuid> PendingSnapshots;
+std::size_t PendingMessages = 0;
 std::map<ObjectGuid, Clock::time_point> LastDiagnosticReply;
+
+void CancelSnapshot(ObjectGuid guid, Subscriber& subscriber)
+{
+    if (subscriber.Pending)
+        PendingMessages -= subscriber.Pending->Delivery.Remaining();
+    subscriber.Pending.reset();
+    std::erase(PendingSnapshots, guid);
+}
+
+struct Timing
+{
+    uint64 Calls = 0;
+    uint64 Microseconds = 0;
+    uint64 Maximum = 0;
+};
+
+class Measure
+{
+public:
+    explicit Measure(Timing* timing) : _timing(timing), _start(timing ? Clock::now() : Clock::time_point{}) { }
+    ~Measure()
+    {
+        if (!_timing)
+            return;
+        auto const elapsed = uint64(std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - _start).count());
+        ++_timing->Calls;
+        _timing->Microseconds += elapsed;
+        _timing->Maximum = std::max(_timing->Maximum, elapsed);
+    }
+
+private:
+    Timing* _timing;
+    Clock::time_point _start;
+};
+
+struct Performance
+{
+    Timing Updates;
+    Timing Common;
+    Timing Players;
+    Timing Conditions;
+    Timing Sampling;
+    Timing PatrolChecks;
+    Timing Encoding;
+    Timing Dispatch;
+    uint64 Visible = 0;
+    uint64 Packets = 0;
+    uint64 Bytes = 0;
+    uint64 Full = 0;
+    uint64 Reused = 0;
+    uint64 Heartbeats = 0;
+    uint64 Patrols = 0;
+    uint64 Deferred = 0;
+    uint64 Cancelled = 0;
+};
 
 std::vector<std::string> GetQuestPoolRows()
 {
@@ -145,11 +225,17 @@ bool ParseHeader(std::string const& payload, std::string_view prefix, uint32& pr
     return true;
 }
 
-bool ParseRequest(std::string const& payload, std::size_t body, std::vector<uint32>& ids)
+bool ParseRequest(std::string const& payload, std::size_t body, std::vector<uint32>& ids, std::string& catalog)
 {
+    auto const separator = payload.find('~', body);
+    if (separator == std::string::npos)
+        return false;
+    catalog = payload.substr(separator + 1);
+    if (catalog != "-" && !QuestieBridge::ValidCatalogId(catalog))
+        return false;
     // Decimal uint32 subscriptions only; no SQL, arbitrary commands or private player data.
     auto first = payload.data() + body;
-    auto const end = payload.data() + payload.size();
+    auto const end = payload.data() + separator;
     while (first != end)
     {
         uint32 id = 0;
@@ -198,24 +284,11 @@ void SendInfo(Player* player, std::string const& token, char const* status)
         + '~' + revision + '~' + status);
 }
 
-bool SendSnapshot(Player* player, Subscriber& subscriber, std::string const& caps,
-    std::vector<std::string> const& rows)
+std::string BuildHeartbeat(Subscriber& subscriber)
 {
-    auto const messages = QuestieBridge::BuildSnapshotMessages(subscriber.Token, subscriber.Sequence + 1, caps, rows);
-    if (!messages)
-        return false;
-    ++subscriber.Sequence;
-    subscriber.SnapshotSequence = subscriber.Sequence;
-    for (auto const& message : *messages)
-        Send(player, message);
-    return true;
-}
-
-void SendHeartbeat(Player* player, Subscriber& subscriber)
-{
-    Send(player, "ALIVE~" + std::to_string(ProtocolVersion) + '~' + subscriber.Token
+    return "ALIVE~" + std::to_string(ProtocolVersion) + '~' + subscriber.Token
         + '~' + std::to_string(++subscriber.Sequence)
-        + '~' + std::to_string(subscriber.SnapshotSequence));
+        + '~' + std::to_string(subscriber.SnapshotSequence);
 }
 
 bool HasCapability(std::string const& caps, std::string_view capability)
@@ -416,6 +489,15 @@ public:
                 caps |= QuestMoney;
         }
         Capabilities.store(caps);
+        _maxWorkTime = std::chrono::milliseconds(std::clamp(
+            sConfigMgr->GetOption<uint32>("QuestieBridge.MaxWorkTimeMs", 2), 1U, 10U));
+        _maxSubscribers = std::clamp(
+            sConfigMgr->GetOption<uint32>("QuestieBridge.MaxSubscribersPerUpdate", 64), 1U, 1024U);
+        _maxMessages = std::clamp(
+            sConfigMgr->GetOption<uint32>("QuestieBridge.MaxMessagesPerUpdate", 256), 128U, 4096U);
+        _diagnostics = sConfigMgr->GetOption<bool>("QuestieBridge.PerformanceLogging", false);
+        _performance = {};
+        _lastReport = Clock::now();
         Dirty.store(true);
         LOG_INFO("server.loading", "mod-questie-bridge: capability mask {}", caps);
     }
@@ -423,57 +505,115 @@ public:
     void OnUpdate(uint32 diff) override
     {
         _elapsed += diff;
-        if (_elapsed < 1000)
+        if (_elapsed < 100)
             return;
-        _elapsed = 0;
+        _elapsed %= 100;
         // Read core state and resolve players on the world thread, after event transitions finish.
         std::lock_guard<std::mutex> guard(SubscriberMutex);
         uint32 const capabilities = Capabilities.load();
         if (!capabilities)
         {
             Subscribers.clear();
+            PendingSnapshots.clear();
+            PendingMessages = 0;
             _commonState.Reset();
+            _conditionCandidates.reset();
             return;
         }
         auto const now = Clock::now();
-        // Resolve and prune before sampling shared state. These pointers live
-        // only within this tick, while the subscriber map is locked.
-        std::vector<std::pair<Player*, Subscriber*>> active;
-        active.reserve(Subscribers.size());
-        bool replyRequested = false;
-        for (auto it = Subscribers.begin(); it != Subscribers.end();)
-        {
-            Player* player = ObjectAccessor::FindPlayer(it->first);
-            if (!player || now - it->second.LastRequest > std::chrono::seconds(45))
-            {
-                it = Subscribers.erase(it);
-                continue;
-            }
-            active.emplace_back(player, &it->second);
-            replyRequested = replyRequested || it->second.ReplyRequested;
-            ++it;
-        }
-        if (active.empty())
+        if (Subscribers.empty())
         {
             _commonState.Reset();
+            _conditionCandidates.reset();
             return;
         }
         bool const dirty = Dirty.exchange(false);
-        _mapCreatures.Reset();
-        auto const& common = _commonState.Get(now, capabilities, dirty, replyRequested,
-            [capabilities]() { return BuildCommonState(capabilities); });
+        if (dirty)
+        {
+            _conditionCandidates.reset();
+            for (auto& [guid, subscriber] : Subscribers)
+            {
+                if (subscriber.Pending)
+                {
+                    CancelSnapshot(guid, subscriber);
+                    subscriber.Previous.clear();
+                }
+                subscriber.CommonRevision = 0;
+            }
+        }
+        auto const& common = _commonState.Get(now, capabilities, dirty, [this, capabilities]()
+        {
+            Measure measure(_diagnostics ? &_performance.Common : nullptr);
+            return BuildCommonState(capabilities);
+        });
+        if (!_catalog || _catalogRevision != _commonState.GetRevision())
+        {
+            Measure measure(_diagnostics ? &_performance.Encoding : nullptr);
+            Acore::Crypto::SHA256 hash;
+            hash.UpdateData(common.Caps);
+            for (auto const& row : common.Rows)
+            {
+                hash.UpdateData(";");
+                hash.UpdateData(row);
+            }
+            hash.Finalize();
+            std::string id;
+            constexpr char digits[] = "0123456789ABCDEF";
+            for (auto byte : hash.GetDigest())
+            {
+                id += digits[byte >> 4];
+                id += digits[byte & 15];
+            }
+            _catalog = QuestieBridge::BuildSnapshotCatalog(std::move(id), common.Rows);
+            _catalogRevision = _commonState.GetRevision();
+        }
+        if (!_catalog)
+            return;
+        auto const reservedMessages = PendingSnapshots.empty() ? 0 : _maxMessages / 2;
+        std::size_t messages = _maxMessages - reservedMessages;
         std::optional<QuestieBridge::QuestConditionIndex> conditions;
         bool conditionsBuilt = false;
-        for (auto const& [player, entry] : active)
+        auto const deadline = Clock::now() + _maxWorkTime;
+        auto remaining = std::min<std::size_t>(_maxSubscribers, Subscribers.size());
+        while (remaining && messages && !Subscribers.empty() && Clock::now() < deadline)
         {
-            Subscriber& subscriber = *entry;
-            // Polling also observes worldstate changes for which AC has no universal hook.
-            if (_commonState.ShouldCheckPlayer(now, subscriber.LastStateCheck, subscriber.CommonRevision,
-                dirty, subscriber.ReplyRequested, subscriber.Previous.empty()))
+            --remaining;
+            auto const previousCursor = _cursor;
+            auto const it = QuestieBridge::NextSubscriber(Subscribers, _cursor);
+            Subscriber& subscriber = it->second;
+            Player* player = ObjectAccessor::FindPlayer(it->first);
+            if (!player || now - subscriber.LastRequest > std::chrono::seconds(45))
             {
+                CancelSnapshot(it->first, subscriber);
+                Subscribers.erase(it);
+                continue;
+            }
+            if (subscriber.Pending)
+                continue;
+            // Sample once when needed; core-owned pointers never leave this player update.
+            std::optional<std::vector<Creature*>> visibleCreatures;
+            auto getVisibleCreatures = [&]() -> std::vector<Creature*> const&
+            {
+                if (!visibleCreatures)
+                {
+                    Measure measure(_diagnostics ? &_performance.Sampling : nullptr);
+                    auto const& entries = (capabilities & Patrols) ? common.PatrolEntries : common.StarterEntries;
+                    visibleCreatures = QuestieBridge::CollectObservableQuestCreatures<Creature>(player, entries);
+                    if (_diagnostics)
+                        _performance.Visible += visibleCreatures->size();
+                }
+                return *visibleCreatures;
+            };
+            // Polling also observes worldstate changes for which AC has no universal hook.
+            bool const needsCheck = _commonState.ShouldCheckPlayer(now, subscriber.LastStateCheck,
+                subscriber.CommonRevision, false, subscriber.ReplyRequested, subscriber.Previous.empty());
+            if (needsCheck && now >= subscriber.RetryAfter)
+            {
+                Measure measure(_diagnostics ? &_performance.Players : nullptr);
                 subscriber.LastStateCheck = now;
                 subscriber.CommonRevision = _commonState.GetRevision();
-                auto rows = common.Rows;
+                std::vector<std::string> rows;
+                auto const sharedRows = common.Rows.size();
                 if (capabilities & Values)
                     for (uint32 id : subscriber.WorldStates)
                         rows.push_back("W:" + std::to_string(id) + ':'
@@ -491,6 +631,7 @@ public:
                 std::set<uint32> locked;
                 if ((capabilities & QuestConditions) && HasCapability(common.Caps, "QUESTDISABLES"))
                 {
+                    Measure lockedMeasure(_diagnostics ? &_performance.Conditions : nullptr);
                     locked = QuestieBridge::ConditionLockedQuests(std::views::keys(sObjectMgr->GetQuestTemplates()),
                         [player](uint32 questId)
                         {
@@ -498,7 +639,7 @@ public:
                             return !quest || player->SatisfyQuestConditions(quest, false);
                         }, IsQuestDisabled);
                     // A partial list would show closed quests as open, so it is all or nothing.
-                    if (rows.size() + locked.size() + lateRows > 4096)
+                    if (sharedRows + rows.size() + locked.size() + lateRows > 4096)
                         locked.clear();
                     for (uint32 questId : locked)
                         rows.push_back("D:" + std::to_string(questId));
@@ -508,35 +649,30 @@ public:
                     uint32 const zone = player->GetZoneId();
                     std::vector<std::string> observations;
                     std::map<std::pair<uint32, uint32>, std::vector<std::pair<Creature*, bool>>> observed;
+                    for (Creature* creature : getVisibleCreatures())
+                        if (common.StarterEntries.contains(creature->GetEntry()))
+                            observed[{creature->GetEntry(), creature->GetSpawnId()}].emplace_back(creature, creature->IsQuestGiver());
+                    // Scripts and visibility conditions keep hidden givers off the client, so they are
+                    // found in range; they remain negative observations while one of their quests shows.
+                    std::list<Creature*> nearby;
+                    Acore::AnyUnitInObjectRangeCheck inRange(player, player->GetVisibilityRange());
+                    Acore::CreatureListSearcher<Acore::AnyUnitInObjectRangeCheck> searcher(player, nearby, inRange);
+                    Cell::VisitObjects(player, searcher, player->GetVisibilityRange());
                     auto const& relations = *sObjectMgr->GetCreatureQuestRelationMap();
-                    auto const& store = player->GetMap()->GetCreatureBySpawnIdStore();
-                    for (auto spawnId : GetMapCreatures(player, common).Starters)
+                    for (Creature* creature : nearby)
                     {
-                        auto const range = store.equal_range(spawnId);
-                        for (auto it = range.first; it != range.second; ++it)
-                        {
-                            Creature* creature = it->second;
-                            if (!creature || !common.StarterEntries.contains(creature->GetEntry())
-                                || !creature->IsInWorld() || !creature->IsAlive() || creature->GetZoneId() != zone
-                                || creature->IsHostileTo(player))
-                                continue;
-                            // Hidden givers remain negative observations; positive overrides require client visibility.
-                            bool const hidden = !player->CanSeeObjectByVisibilityConditions(creature)
+                        bool const hidden = !player->CanSeeObjectByVisibilityConditions(creature)
                                 || (creature->IsAIEnabled && !creature->AI()->CanBeSeen(player));
-                            if (hidden)
-                            {
-                                std::vector<uint32> started;
-                                auto const quests = relations.equal_range(creature->GetEntry());
-                                for (auto quest = quests.first; quest != quests.second; ++quest)
-                                    started.push_back(quest->second);
-                                if (!QuestieBridge::HiddenGiverHasVisibleQuest(started,
-                                        [&locked](uint32 questId) { return locked.contains(questId) || IsQuestDisabled(questId); }))
-                                    continue;
-                            }
-                            else if (!QuestieBridge::IsQuestCreatureObservable(player, creature))
-                                continue;
-                            observed[{creature->GetEntry(), spawnId}].emplace_back(creature, !hidden && creature->IsQuestGiver());
-                        }
+                        if (!hidden || !creature->GetSpawnId() || !common.StarterEntries.contains(creature->GetEntry())
+                            || creature->GetZoneId() != zone || creature->IsHostileTo(player))
+                            continue;
+                        std::vector<uint32> started;
+                        auto const quests = relations.equal_range(creature->GetEntry());
+                        for (auto quest = quests.first; quest != quests.second; ++quest)
+                            started.push_back(quest->second);
+                        if (QuestieBridge::HiddenGiverHasVisibleQuest(started,
+                                [&locked](uint32 questId) { return locked.contains(questId) || IsQuestDisabled(questId); }))
+                            observed[{creature->GetEntry(), creature->GetSpawnId()}].emplace_back(creature, false);
                     }
                     for (auto const& [identity, creatures] : observed)
                     {
@@ -565,7 +701,7 @@ public:
                         + ((capabilities & QuestMoney) ? 1 : 0)
                         + (common.ReportResets ? 1 : 0);
 
-                    if (zone && observations.size() <= MaxGiverObservations && rows.size() + observations.size() + 1 + reserved <= 4096)
+                    if (zone && observations.size() <= MaxGiverObservations && sharedRows + rows.size() + observations.size() + 1 + reserved <= 4096)
                     {
                         std::sort(observations.begin(), observations.end());
                         playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTGIVERS");
@@ -573,54 +709,62 @@ public:
                             + ':' + std::to_string(zone));
                         rows.insert(rows.end(), observations.begin(), observations.end());
                         // Never apply template restrictions without a complete set of live exceptions.
-                        common.AppendGiverTemplates(rows, playerCaps, reserved);
+                        common.AppendGiverTemplates(rows, playerCaps, sharedRows + reserved);
                     }
                 }
-                if ((capabilities & Phases) && rows.size() + PhaseMaxRows + (common.ReportResets ? 1 : 0) <= 4096)
+                if ((capabilities & Phases) && sharedRows + rows.size() + PhaseMaxRows + (common.ReportResets ? 1 : 0) <= 4096)
                 {
                     playerCaps += (playerCaps.empty() ? "" : ",");
                     playerCaps += "PHASES";
                     QuestieBridge::AppendPhases(player, rows);
                 }
                 if ((capabilities & ICC)
-                    && rows.size() + QuestieBridgeICCMaxRows + (common.ReportResets ? 1 : 0) <= 4096)
+                    && sharedRows + rows.size() + QuestieBridgeICCMaxRows + (common.ReportResets ? 1 : 0) <= 4096)
                 {
                     playerCaps += (playerCaps.empty() ? "" : ",");
                     playerCaps += "ICC";
                     AppendQuestieBridgeICC(player, rows);
                 }
-                if ((capabilities & QuestXP) && rows.size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
+                if ((capabilities & QuestXP) && sharedRows + rows.size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
                     && QuestieBridge::AppendQuestXP(player, rows))
                     playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTXP");
                 if (common.ReputationRows
-                    && rows.size() + common.ReputationRows->size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
+                    && sharedRows + rows.size() + common.ReputationRows->size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
                     && QuestieBridge::AppendQuestReputation(player, *common.ReputationRows, rows))
                     playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTREP");
-                if ((capabilities & QuestMoney) && rows.size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
+                if ((capabilities & QuestMoney) && sharedRows + rows.size() + 1 + (common.ReportResets ? 1 : 0) <= 4096
                     && QuestieBridge::AppendQuestMoney(rows))
                     playerCaps += (playerCaps.empty() ? "" : ",") + std::string("QUESTMONEY");
                 // Full era restrictions already evaluate these conditions when disables are available.
                 if ((capabilities & QuestConditions) && !HasCapability(common.Caps, "QUESTDISABLES"))
                 {
+                    Measure conditionMeasure(_diagnostics ? &_performance.Conditions : nullptr);
                     // Shared for this tick; never reuse classification across a condition reload.
                     if (!conditionsBuilt)
                     {
                         conditionsBuilt = true;
-                        conditions = QuestieBridge::BuildQuestConditionIndex(sObjectMgr->GetQuestTemplates(),
-                            [](uint32 id)
-                            {
-                                return sConditionMgr->GetConditionsForNotGroupedEntry(
-                                    CONDITION_SOURCE_TYPE_QUEST_AVAILABLE, id);
-                            }, [](uint32 id) { return sConditionMgr->GetConditionReferences(id); });
+                        auto available = [](uint32 id)
+                        {
+                            return sConditionMgr->GetConditionsForNotGroupedEntry(
+                                CONDITION_SOURCE_TYPE_QUEST_AVAILABLE, id);
+                        };
+                        if (!_conditionCandidates || now - _lastConditionDiscovery >= QuestieBridge::StateCheckInterval)
+                        {
+                            _conditionCandidates = QuestieBridge::FindQuestConditionCandidates(
+                                sObjectMgr->GetQuestTemplates(), available);
+                            _lastConditionDiscovery = now;
+                        }
+                        conditions = QuestieBridge::BuildQuestConditionIndex(*_conditionCandidates,
+                            available, [](uint32 id) { return sConditionMgr->GetConditionReferences(id); });
                     }
                     if (conditions)
                         QuestieBridge::AppendQuestConditions(*conditions, [player](uint32 id)
                         {
                             Quest const* quest = sObjectMgr->GetQuestTemplate(id);
                             return !quest || player->SatisfyQuestConditions(quest, false);
-                        }, rows, playerCaps, common.ReportResets ? 1 : 0);
+                        }, rows, playerCaps, sharedRows + (common.ReportResets ? 1 : 0));
                 }
-                std::string signature = playerCaps;
+                std::string signature = std::to_string(_commonState.GetRevision()) + ':' + playerCaps;
                 for (std::string const& row : rows)
                     signature += ';' + row;
                 bool const changed = signature != subscriber.Previous;
@@ -632,79 +776,201 @@ public:
                         // change the signature and turn every heartbeat into a full batch.
                         if (common.ReportResets)
                             rows.push_back("P:SERVER_TIME:" + std::to_string(GameTime::GetGameTime().count()));
-                        if (!SendSnapshot(player, subscriber, playerCaps, rows))
+                        if (!QueueSnapshot(player, subscriber, playerCaps, rows, std::move(signature), now))
                         {
                             subscriber.Previous.clear();
-                            subscriber.SnapshotSequence = 0;
+                            subscriber.RetryAfter = now + std::chrono::seconds(1);
                             continue;
                         }
-                        subscriber.Previous = std::move(signature);
                     }
                     else
-                        SendHeartbeat(player, subscriber);
-                    subscriber.LastSend = now;
-                    subscriber.ReplyRequested = false;
+                    {
+                        subscriber.RenewalRequested = true;
+                        subscriber.ReplyRequested = false;
+                    }
                 }
             }
-            // Heartbeats and patrols retain their cadence even between state checks.
-            if (subscriber.SnapshotSequence && now - subscriber.LastSend >= std::chrono::seconds(10))
+            if (subscriber.Pending)
+                continue;
+            if (messages && subscriber.SnapshotSequence && !subscriber.Previous.empty()
+                && _commonState.CanRenewPlayer(now, subscriber.LastStateCheck, subscriber.CommonRevision)
+                && (subscriber.RenewalRequested || now - subscriber.LastSend >= std::chrono::seconds(10)))
             {
-                SendHeartbeat(player, subscriber);
+                SendMessage(player, BuildHeartbeat(subscriber));
+                --messages;
+                if (_diagnostics)
+                    ++_performance.Heartbeats;
                 subscriber.LastSend = now;
+                subscriber.RenewalRequested = false;
             }
-            if ((capabilities & Patrols) && subscriber.SnapshotSequence)
-                SendPatrol(player, subscriber, common);
+            if ((capabilities & Patrols) && subscriber.SnapshotSequence
+                && now - subscriber.LastPatrolCheck >= std::chrono::seconds(1))
+            {
+                if (SendPatrol(player, subscriber, common, getVisibleCreatures(), messages))
+                    subscriber.LastPatrolCheck = now;
+                else
+                {
+                    _cursor = previousCursor;
+                    break;
+                }
+            }
         }
+        messages += reservedMessages;
+        DispatchSnapshots(messages);
+        ReportPerformance(now);
     }
 
 private:
-    QuestieBridge::MapQuestCreatures const& GetMapCreatures(Player* player, QuestieBridge::CommonState const& common)
+    void SendMessage(Player* player, std::string const& message)
     {
-        return _mapCreatures.Get(player->GetMapId(), player->GetInstanceId(), [&]()
+        Send(player, message);
+        if (_diagnostics)
         {
-            QuestieBridge::MapQuestCreatures candidates;
-            for (auto const& [spawnId, creature] : player->GetMap()->GetCreatureBySpawnIdStore())
-            {
-                if (!creature || !spawnId)
-                    continue;
-                if (common.StarterEntries.contains(creature->GetEntry()))
-                    candidates.Starters.insert(spawnId);
-                if (!common.PatrolEntries.contains(creature->GetEntry()))
-                    continue;
-                CreatureData const* data = creature->GetCreatureData();
-                if (creature->GetTransport() || (data && data->movementType != IDLE_MOTION_TYPE)
-                    || creature->GetMotionMaster()->GetCurrentMovementGeneratorType() != IDLE_MOTION_TYPE)
-                    candidates.Patrols.insert(spawnId);
-            }
-            return candidates;
-        });
+            ++_performance.Packets;
+            _performance.Bytes += message.size();
+        }
     }
 
-    void SendPatrol(Player* player, Subscriber& subscriber, QuestieBridge::CommonState const& common)
+    bool QueueSnapshot(Player* player, Subscriber& subscriber, std::string const& caps,
+        std::vector<std::string> const& rows, std::string signature, Clock::time_point now)
     {
+        Measure measure(_diagnostics ? &_performance.Encoding : nullptr);
+        if (PendingSnapshots.size() >= 64)
+        {
+            if (_diagnostics)
+                ++_performance.Deferred;
+            return false;
+        }
+        bool const reuse = subscriber.KnownCatalog == _catalog->Id;
+        auto messages = QuestieBridge::BuildSnapshotMessages(subscriber.Token,
+            subscriber.Sequence + 1, caps, rows, *_catalog, reuse);
+        if (!messages)
+            return false;
+        // Keep queued work below three seconds of reserved dispatch capacity.
+        if (PendingMessages + messages->size() > _maxMessages / 2 * 30)
+        {
+            if (_diagnostics)
+                ++_performance.Deferred;
+            return false;
+        }
+        PendingMessages += messages->size();
+        subscriber.Pending.emplace(PendingSnapshot{QuestieBridge::SnapshotDelivery(std::move(*messages), now),
+            std::move(signature), _catalog->Id, ++subscriber.Sequence, _commonState.GetRevision()});
+        PendingSnapshots.push_back(player->GetGUID());
+        if (_diagnostics)
+            ++(reuse ? _performance.Reused : _performance.Full);
+        return true;
+    }
+
+    void DispatchSnapshots(std::size_t& messages)
+    {
+        Measure measure(_diagnostics ? &_performance.Dispatch : nullptr);
+        auto const now = Clock::now();
+        while (messages && !PendingSnapshots.empty())
+        {
+            auto const guid = PendingSnapshots.front();
+            auto const found = Subscribers.find(guid);
+            if (found == Subscribers.end())
+            {
+                PendingSnapshots.pop_front();
+                continue;
+            }
+            Subscriber& subscriber = found->second;
+            Player* player = ObjectAccessor::FindPlayer(guid);
+            if (!player || !subscriber.Pending || now - subscriber.LastRequest > std::chrono::seconds(45))
+            {
+                CancelSnapshot(guid, subscriber);
+                continue;
+            }
+            auto& pending = *subscriber.Pending;
+            if (pending.Delivery.Expired(now) || pending.Revision != _commonState.GetRevision())
+            {
+                CancelSnapshot(guid, subscriber);
+                subscriber.Previous.clear();
+                subscriber.ReplyRequested = true;
+                if (_diagnostics)
+                    ++_performance.Cancelled;
+                continue;
+            }
+            auto const sent = pending.Delivery.Dispatch(messages,
+                [this, player](std::string const& message) { SendMessage(player, message); });
+            messages -= sent;
+            PendingMessages -= sent;
+            if (pending.Delivery.Complete())
+            {
+                subscriber.Previous = std::move(pending.Signature);
+                subscriber.KnownCatalog = std::move(pending.Catalog);
+                subscriber.SnapshotSequence = pending.Sequence;
+                subscriber.LastSend = now;
+                subscriber.ReplyRequested = false;
+                subscriber.RenewalRequested = false;
+                CancelSnapshot(guid, subscriber);
+            }
+        }
+    }
+
+    void ReportPerformance(Clock::time_point now)
+    {
+        if (!_diagnostics)
+            return;
+        auto const elapsed = uint64(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - now).count());
+        ++_performance.Updates.Calls;
+        _performance.Updates.Microseconds += elapsed;
+        _performance.Updates.Maximum = std::max(_performance.Updates.Maximum, elapsed);
+        if (now - _lastReport < std::chrono::seconds(60))
+            return;
+        LOG_INFO("module.questiebridge", "Questie bridge: subscribers {}, queued {}, full/reused {}/{}, "
+            "heartbeats {}, patrols {}, packets {}, payload bytes {}, deferred {}, cancelled {}",
+            Subscribers.size(), PendingSnapshots.size(), _performance.Full, _performance.Reused,
+            _performance.Heartbeats, _performance.Patrols, _performance.Packets, _performance.Bytes,
+            _performance.Deferred, _performance.Cancelled);
+        LOG_INFO("module.questiebridge", "Questie bridge timing (calls/total us/max us): "
+            "updates {}/{}/{}, common {}/{}/{}, "
+            "players {}/{}/{}, conditions {}/{}/{}, sampling {}/{}/{}, patrol checks {}/{}/{}, "
+            "encoding {}/{}/{}, dispatch {}/{}/{}; visible NPCs {}",
+            _performance.Updates.Calls, _performance.Updates.Microseconds, _performance.Updates.Maximum,
+            _performance.Common.Calls, _performance.Common.Microseconds, _performance.Common.Maximum,
+            _performance.Players.Calls, _performance.Players.Microseconds, _performance.Players.Maximum,
+            _performance.Conditions.Calls, _performance.Conditions.Microseconds, _performance.Conditions.Maximum,
+            _performance.Sampling.Calls, _performance.Sampling.Microseconds, _performance.Sampling.Maximum,
+            _performance.PatrolChecks.Calls, _performance.PatrolChecks.Microseconds, _performance.PatrolChecks.Maximum,
+            _performance.Encoding.Calls, _performance.Encoding.Microseconds, _performance.Encoding.Maximum,
+            _performance.Dispatch.Calls, _performance.Dispatch.Microseconds, _performance.Dispatch.Maximum,
+            _performance.Visible);
+        _performance = {};
+        _lastReport = now;
+    }
+
+    bool SendPatrol(Player* player, Subscriber& subscriber, QuestieBridge::CommonState const& common,
+        std::vector<Creature*> const& visibleCreatures, std::size_t& messages)
+    {
+        Measure measure(_diagnostics ? &_performance.PatrolChecks : nullptr);
         auto const mapKey = std::make_pair(player->GetMapId(), player->GetInstanceId());
         auto const& store = player->GetMap()->GetCreatureBySpawnIdStore();
         std::vector<std::string> rows;
         uint32 const zone = player->GetZoneId();
         bool overflow = false;
-        for (auto const spawnId : GetMapCreatures(player, common).Patrols)
+        std::map<uint32, std::vector<Creature*>> observed;
+        for (Creature* creature : visibleCreatures)
+            if (common.PatrolEntries.contains(creature->GetEntry()))
+                observed[creature->GetSpawnId()].push_back(creature);
+        for (auto const& [spawnId, creatures] : observed)
         {
-            Creature* selected = nullptr;
-            bool ambiguous = false;
+            if (creatures.size() != 1)
+                continue;
+            // A moving sibling can classify this spawn even when that sibling is invisible.
             auto const range = store.equal_range(spawnId);
-            for (auto it = range.first; it != range.second; ++it)
+            bool const patrol = std::any_of(range.first, range.second, [&common](auto const& item)
             {
-                Creature* creature = it->second;
-                if (!creature->IsInWorld() || !creature->IsAlive() || creature->GetZoneId() != zone
-                    || !common.PatrolEntries.contains(creature->GetEntry())
-                    || !QuestieBridge::IsQuestCreatureObservable(player, creature)
-                    || creature->IsHostileTo(player))
-                    continue;
-                if (selected)
-                    ambiguous = true;
-                selected = creature;
-            }
-            if (!selected || ambiguous || !std::isfinite(selected->GetPositionX()) || !std::isfinite(selected->GetPositionY()))
+                Creature* creature = item.second;
+                if (!creature || !common.PatrolEntries.contains(creature->GetEntry()))
+                    return false;
+                CreatureData const* data = creature->GetCreatureData();
+                return creature->GetTransport() || (data && data->movementType != IDLE_MOTION_TYPE)
+                    || creature->GetMotionMaster()->GetCurrentMovementGeneratorType() != IDLE_MOTION_TYPE;
+            });
+            Creature* selected = creatures.front();
+            if (!patrol || !std::isfinite(selected->GetPositionX()) || !std::isfinite(selected->GetPositionY()))
                 continue;
             // Transport passengers already have world coordinates here, including
             // their deck offset. Do not project the database's deck-local position.
@@ -721,7 +987,7 @@ private:
         std::string const status = overflow ? "OVERFLOW" : "READY";
         std::string const state = context + '~' + status + (rows.empty() ? "~EMPTY" : "~LIVE");
         if (rows.empty() && subscriber.PatrolContext == state && subscriber.PatrolSnapshot == subscriber.SnapshotSequence)
-            return;
+            return true;
         std::vector<std::string> parts;
         std::string part;
         for (std::string const& row : rows)
@@ -737,22 +1003,42 @@ private:
         }
         if (!part.empty())
             parts.push_back(part);
+        if (parts.size() + 2 > messages)
+        {
+            if (_diagnostics)
+                ++_performance.Deferred;
+            return false;
+        }
+        messages -= parts.size() + 2;
+        if (_diagnostics)
+            ++_performance.Patrols;
         // Separate sequencing and complete batches prevent partial positions from
         // moving pins, and cannot renew the main quest-state snapshot's freshness.
         std::string const header = Acore::StringFormat("~{}~{}~{}~{}", ProtocolVersion, subscriber.Token,
             subscriber.SnapshotSequence, ++subscriber.PatrolSequence);
-        Send(player, "MBEGIN" + header + '~' + context + '~' + std::to_string(rows.size())
+        SendMessage(player, "MBEGIN" + header + '~' + context + '~' + std::to_string(rows.size())
             + '~' + std::to_string(parts.size()) + '~' + status);
         for (std::size_t index = 0; index < parts.size(); ++index)
-            Send(player, "MPART" + header + '~' + std::to_string(index + 1) + '~' + parts[index]);
-        Send(player, "MEND" + header);
+            SendMessage(player, "MPART" + header + '~' + std::to_string(index + 1) + '~' + parts[index]);
+        SendMessage(player, "MEND" + header);
         subscriber.PatrolContext = state;
         subscriber.PatrolSnapshot = subscriber.SnapshotSequence;
+        return true;
     }
 
     QuestieBridge::CommonStateCache _commonState;
+    std::optional<QuestieBridge::SnapshotCatalog> _catalog;
+    uint64 _catalogRevision = 0;
+    std::optional<std::map<uint32, bool>> _conditionCandidates;
+    Clock::time_point _lastConditionDiscovery;
+    Clock::time_point _lastReport;
+    ObjectGuid _cursor;
+    std::chrono::milliseconds _maxWorkTime{2};
+    std::size_t _maxSubscribers = 64;
+    std::size_t _maxMessages = 256;
+    bool _diagnostics = false;
+    Performance _performance;
     uint32 _elapsed = 0;
-    QuestieBridge::MapQuestCreatureCache _mapCreatures;
 };
 
 class QuestieBridgeEventScript final : public GameEventScript
@@ -762,6 +1048,18 @@ public:
         {GAMEEVENTHOOK_ON_START, GAMEEVENTHOOK_ON_STOP}) { }
     void OnStart(uint16 /*eventId*/) override { Dirty.store(true); }
     void OnStop(uint16 /*eventId*/) override { Dirty.store(true); }
+};
+
+class QuestieBridgeDatabaseScript final : public DatabaseScript
+{
+public:
+    QuestieBridgeDatabaseScript() : DatabaseScript("QuestieBridgeDatabaseScript",
+        {DATABASEHOOK_ON_AFTER_DATABASE_LOAD_CREATURETEMPLATES}) { }
+
+    void OnAfterDatabaseLoadCreatureTemplates(std::vector<CreatureTemplate*> /*templates*/) override
+    {
+        Dirty.store(true);
+    }
 };
 
 class QuestieBridgePlayerScript final : public PlayerScript
@@ -782,6 +1080,7 @@ public:
         uint32 requestedProtocol = 0;
         std::size_t body = 0;
         std::vector<uint32> ids;
+        std::string catalog;
         std::string const payload = message.substr(sizeof(Envelope) - 1);
         bool const renewal = payload.compare(0, 4, "ACK~") == 0;
         if (!ParseHeader(payload, renewal ? "ACK~" : "WATCH~", requestedProtocol, token, body))
@@ -789,7 +1088,7 @@ public:
         bool const compatible = requestedProtocol == ProtocolVersion;
         // An incompatible WATCH receives diagnostics only; its body is not interpreted.
         bool const valid = renewal ? compatible && ParseAcknowledgement(payload, body, acknowledged)
-            : !compatible || ParseRequest(payload, body, ids);
+            : !compatible || ParseRequest(payload, body, ids, catalog);
         if (!valid)
             return false;
         std::lock_guard<std::mutex> guard(SubscriberMutex);
@@ -803,9 +1102,15 @@ public:
                 return false;
             Subscriber& subscriber = found->second;
             subscriber.LastRequest = now;
-            subscriber.ReplyRequested = true;
+            subscriber.RenewalRequested = true;
             if (acknowledged != subscriber.SnapshotSequence)
+            {
+                CancelSnapshot(player->GetGUID(), subscriber);
+                subscriber.ReplyRequested = true;
+                subscriber.RetryAfter = {};
                 subscriber.Previous.clear();
+                subscriber.KnownCatalog.clear();
+            }
             return false;
         }
         auto const previousInfo = LastDiagnosticReply.find(player->GetGUID());
@@ -818,12 +1123,16 @@ public:
             return false;
         }
         Subscriber& subscriber = Subscribers[player->GetGUID()];
+        CancelSnapshot(player->GetGUID(), subscriber);
+        subscriber.RetryAfter = {};
         subscriber.Token = std::move(token);
         subscriber.WorldStates = std::move(ids);
+        subscriber.KnownCatalog = std::move(catalog);
         subscriber.LastRequest = now;
         subscriber.Previous.clear();
         subscriber.SnapshotSequence = 0;
         subscriber.ReplyRequested = true;
+        subscriber.RenewalRequested = false;
         SendInfo(player, subscriber.Token, "READY");
         return false;
     }
@@ -831,6 +1140,9 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         std::lock_guard<std::mutex> guard(SubscriberMutex);
+        auto const found = Subscribers.find(player->GetGUID());
+        if (found != Subscribers.end())
+            CancelSnapshot(player->GetGUID(), found->second);
         Subscribers.erase(player->GetGUID());
         LastDiagnosticReply.erase(player->GetGUID());
     }
@@ -843,5 +1155,6 @@ void AddSC_questie_bridge()
     RegisterQuestieBridgeICC();
     new QuestieBridgeWorldScript();
     new QuestieBridgeEventScript();
+    new QuestieBridgeDatabaseScript();
     new QuestieBridgePlayerScript();
 }

@@ -38,7 +38,8 @@ No SQL installation is required. Enable **Available Scourge Invasion Quests** or
 
 ## Configuration
 
-All options default to `1` (enabled). Set an option to `0` to disable it, then run `.reload config`.
+Feature switches default to `1` (enabled).
+Set an option to `0` to disable it, then run `.reload config`.
 
 | Option | Controls |
 | --- | --- |
@@ -61,11 +62,20 @@ All options default to `1` (enabled). Set an option to `0` to disable it, then r
 | `QuestieBridge.QuestReputation` | Quest reputation rates and active reputation bonuses |
 | `QuestieBridge.QuestMoney` | Ordinary and maximum-level bonus money rates |
 
+Work runs in rotating batches every 100ms. `MaxWorkTimeMs` defaults to `2` (checked between players),
+`MaxSubscribersPerUpdate` to `64`, and `MaxMessagesPerUpdate` to `256`. Shared rebuilds and individual
+checks can exceed the cooperative time budget. Delivery bounds queued snapshots and reserves capacity
+for heartbeats and patrols. Unfinished snapshots are discarded after four seconds.
+Overload can delay updates or restore static fallback.
+`PerformanceLogging = 1` writes aggregate timings and traffic once per minute to `module.questiebridge`.
+Timings are calls/total microseconds/maximum microseconds; byte counts cover state and patrol payloads.
+Phase timings overlap; use `updates` for total bridge time.
+
 ## Checking the connection
 
 | Command | Shows |
 | --- | --- |
-| `/qserver` | Connection, versions, and live state |
+| `/qserver` | Connection, versions, live state, and catalog reuse counts |
 | `/qserver quest <quest ID>` | Whether a quest is explicitly disabled on the server |
 | `/qserver conditions` | Player-specific condition restrictions, when enabled |
 | `/qserver giver <NPC ID>` | Global template restriction and unavailable observed spawn IDs |
@@ -82,6 +92,9 @@ All options default to `1` (enabled). Set an option to `0` to disable it, then r
 ## Behavior
 
 Changes normally appear within a few seconds. Rehover or reopen reward displays to refresh them.
+Shared catalogs are cached; player-specific changes send smaller complete updates.
+Matching ACKs renew subscriptions without forcing state rebuilding. Regular verification still runs.
+NPC sampling visits the player's visible objects, with positions and visibility checked individually.
 Rate changes through `.reload config` and `.reload reputation_reward_rate` need no addon reload
 or corrections regeneration. XP bonuses do not increase the maximum-level money bonus.
 Reward previews can differ from final awards because of server rounding, caps, or custom rules.
@@ -91,8 +104,8 @@ Live NPC spawn observations take precedence locally, including scripted questgiv
 grants. Positive questgiver observations and patrol samples require the creature to be
 present at the player's client and pass current distance, phasing, and detection checks.
 Distant loaded creatures do not supply positive overrides; their template restrictions still apply.
-NPCs hidden by scripts or visibility conditions remain negative observations unless every quest
-they start is already hidden.
+NPCs in visibility range that scripts or visibility conditions hide remain negative observations
+unless every quest they start is already hidden.
 
 Quests whose availability conditions the player fails are reported like disabled quests while they
 stay closed, so `/qserver quest <quest ID>` shows them as disabled. A quest already in the quest log
@@ -125,15 +138,16 @@ Public-server performance validation remains outstanding.
 
 ## Protocol
 
-Protocol **20** requires a matching addon. `INFO~1` remains the independent version
+Protocol **21** requires a matching addon. `INFO~1` remains the independent version
 diagnostic handshake; a mismatch restores static addon behavior without downgrading.
 
 Snapshots retain `BEGIN` / `PART` / `END`, with compact capabilities in the same field:
 
 ```text
-BEGIN~20~token~sequence~mask~rowCount~partCount
-PART~20~token~sequence~partIndex~row;row;...
-END~20~token~sequence
+WATCH~21~token~worldstateIds~knownCatalogIdOrDash
+BEGIN~21~token~sequence~mask~wireRowCount~partCount~catalogId~catalogRowsOrR
+PART~21~token~sequence~partIndex~row;row;...
+END~21~token~sequence
 ```
 
 The mask contains one to four uppercase, eight-digit hexadecimal 32-bit words,
@@ -158,16 +172,24 @@ Bits 19–127 are unassigned and rejected when set. Each word is decoded separat
 preserve Lua 5.1 numeric precision.
 
 Messages use addon prefix `QSTSVR` and a maximum 240-byte payload. Snapshot row data is packed
-into parts of at most 150 bytes, with at most 4,096 rows and 1,024 parts per snapshot.
+into parts of at most 150 bytes, with at most 4,096 logical rows and 1,024 transmitted parts per snapshot.
 Tokens are 1–32 alphanumeric characters; sequences are positive integers up to `9007199254740991`.
 The client validates tokens, sequences, counts, and every row before atomic replacement; incomplete
 batches are discarded after five seconds. State expires after 30 seconds without a valid snapshot or heartbeat.
+A valid `INFO READY` permits waiting up to 30 seconds from WATCH for initial delivery;
+BEGIN still starts a fixed five-second assembly deadline. INFO never renews quest-state freshness.
+
+Catalog IDs are 64 uppercase hexadecimal SHA-256 digits identifying shared contents and capabilities.
+A numeric `catalogRowsOrR` declares the shared prefix of a full batch; `R` reuses a matching fresh catalog.
+`wireRowCount` counts transmitted rows; reused rows still count toward the logical limit.
+The client publishes only complete validated replacements. Unknown references request a resync.
+`WATCH` may advertise a fresh catalog across zone transitions; `-` requests full data, also used if the hint exceeds 240 bytes.
 
 `QUESTCONDITIONS` requires exactly one `P:QC_COUNT:<count>` row plus that many unique
 `C:<questId>` rows, limited to 512 quests. These are negative restrictions only; a zero count grants nothing.
 Catalog overflow or insufficient snapshot space omits the capability rather than sending a partial catalog.
 
-Heartbeats (`ALIVE~20~token~sequence~snapshotSequence`) renew only an already fresh, complete snapshot.
+Heartbeats (`ALIVE~21~token~sequence~snapshotSequence`) renew only an already fresh, complete snapshot.
 Patrol batches are sequenced separately; samples expire after five seconds and never renew quest-state freshness.
 `INFO~1` diagnoses versions without establishing or renewing availability state.
 
